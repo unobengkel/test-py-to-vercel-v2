@@ -9,33 +9,29 @@ import uuid
 
 app = FastAPI(title="KameraTamu Middleware Server")
 
-# Izinkan akses CORS agar Web Simulator (Browser) bisa mengirim permintaan ke server ini
+# Izinkan akses CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Mengizinkan akses dari domain mana saja
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ==========================================
-# KONFIGURASI DARI REFERENSI KODE ESP32
+# KONFIGURASI SUPABASE & AI SERVER
 # ==========================================
 
-# 1. Supabase Alamat 1 (Settings)
 SUPABASE_URL_1 = "https://wqqrjsjytlcvkkgziana.supabase.co"
 SUPABASE_KEY_1 = "sb_publishable_nqnraHg2CUUot95hRWv5fA_ZuDozNyM"
 
-# 2. Supabase Alamat 2 (Target Storage & Database)
 SUPABASE_URL_2 = "https://tbgbulvofncfgntqrrya.supabase.co"
 SUPABASE_KEY_2 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRiZ2J1bHZvZm5jZmdudHFycnlhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE5NDk1NjEsImV4cCI6MjA4NzUyNTU2MX0.EdlAomiUlbicGZRscxuW6fHNLqY-uA48jNcps_0ltE8"
 TARGET_BUCKET = "photos"
-TARGET_TABLE = "photos_data" # Sesuaikan dengan nama tabel di Supabase 2 Anda
+TARGET_TABLE = "photos_data"
 
-# 3. AI Server
 AI_SERVER_URL = "https://www.kameratamu.com/api/apply-filter"
 
-# Headers Helper
 HEADERS_SUPA_1 = {
     "apikey": SUPABASE_KEY_1,
     "Authorization": f"Bearer {SUPABASE_KEY_1}",
@@ -52,7 +48,7 @@ HEADERS_SUPA_2 = {
 # ==========================================
 
 def get_event_settings(slug: str):
-    """Langkah 1 & 2: Dapatkan Event ID dan Settings dari Supabase 1"""
+    """Ambil Event ID, Filter Settings, dan Capture Settings dari Supabase 1"""
     rpc_url = f"{SUPABASE_URL_1}/rest/v1/rpc/get_event_by_slug"
     res_rpc = requests.post(rpc_url, headers=HEADERS_SUPA_1, json={"p_slug": slug})
     
@@ -80,7 +76,7 @@ def get_event_settings(slug: str):
     }
 
 def apply_ai_filter(image_bytes: bytes, settings: dict):
-    """Langkah 4: Kirim ke AI jika Filter ON"""
+    """Kirim gambar ke server AI jika Filter diaktifkan"""
     print("[INFO] Menerapkan Filter AI...")
     
     base64_img = base64.b64encode(image_bytes).decode('utf-8')
@@ -104,23 +100,25 @@ def apply_ai_filter(image_bytes: bytes, settings: dict):
     }
     
     try:
-        # PERUBAHAN: Timeout disesuaikan ke 10 detik agar tidak melebihi batas Vercel Free
-        res = requests.post(AI_SERVER_URL, json=payload, headers=headers, timeout=10)
+        # Timeout ditingkatkan ke 60 detik jika tidak di Vercel Serverless
+        res = requests.post(AI_SERVER_URL, json=payload, headers=headers, timeout=60)
         
-        if res.status_code == 200:
-            return res.content
+        if res.status_code == 200 and len(res.content) > 0:
+            print("[SUCCESS] Filter AI berhasil diterapkan oleh AI Server.")
+            return res.content, True
         else:
-            print(f"[ERROR] AI Server gagal ({res.status_code}). Fallback ke gambar asli.")
-            return image_bytes
+            print(f"[ERROR] AI Server gagal dengan status {res.status_code}: {res.text[:100]}. Fallback ke gambar asli.")
+            return image_bytes, False
+            
     except requests.exceptions.Timeout:
-        print("[WARNING] AI Server Timeout (>10s). Fallback ke gambar asli.")
-        return image_bytes
+        print("[WARNING] AI Server Timeout (>60s). Fallback ke gambar asli.")
+        return image_bytes, False
     except Exception as e:
         print(f"[ERROR] Gagal memproses AI filter: {e}")
-        return image_bytes
+        return image_bytes, False
 
 def upload_to_supabase_2(image_bytes: bytes):
-    """Langkah 5: Upload gambar ke Storage Supabase 2"""
+    """Upload gambar ke Storage Supabase 2"""
     file_name = f"photo_{int(time.time())}_{uuid.uuid4().hex[:6]}.jpg"
     storage_url = f"{SUPABASE_URL_2}/storage/v1/object/{TARGET_BUCKET}/{file_name}"
     
@@ -135,7 +133,7 @@ def upload_to_supabase_2(image_bytes: bytes):
         raise HTTPException(status_code=500, detail=f"Gagal upload ke storage: {res.text}")
 
 def save_data_to_supabase_2(event_id: str, file_name: str, is_filtered: bool):
-    """Langkah 6: Simpan informasi/log ke Table Database Supabase 2"""
+    """Simpan informasi/log ke Table Database Supabase 2"""
     table_url = f"{SUPABASE_URL_2}/rest/v1/{TARGET_TABLE}"
     
     headers = HEADERS_SUPA_2.copy()
@@ -163,28 +161,33 @@ async def process_camera_image(slug: str, image: UploadFile = File(...)):
         image_bytes = await image.read()
         print(f"[INFO] Menerima gambar untuk slug: {slug} (Size: {len(image_bytes)} bytes)")
         
+        # 1. Ambil Pengaturan dari Supabase 1
         settings = get_event_settings(slug)
-        print(f"[INFO] Event ID ditemukan: {settings['event_id']}")
+        print(f"[INFO] Event ID: {settings['event_id']}, Filter Enabled: {settings['filter'].get('enabled')}")
         
+        is_filter_enabled = settings['filter'].get('enabled') is True
         is_filtered = False
         final_image = image_bytes
         
-        if settings['filter'].get('enabled') == True or settings['filter'].get('enabled') == False:
-            final_image = apply_ai_filter(image_bytes, settings)
-            is_filtered = True if final_image != image_bytes else False
+        # 2. Proses AI Filter HANYA JIKA Filter Diaktifkan (enabled == True)
+        if is_filter_enabled:
+            final_image, is_filtered = apply_ai_filter(image_bytes, settings)
         else:
-            print("[INFO] AI Filter dimatikan (Disabled). Menggunakan gambar asli.")
+            print("[INFO] AI Filter di-disable di Supabase. Menggunakan gambar asli.")
         
+        # 3. Upload ke Supabase 2 Storage
         file_name = upload_to_supabase_2(final_image)
         print(f"[SUCCESS] Gambar terunggah: {file_name}")
         
+        # 4. Simpan Log ke Tabel Supabase 2
         save_data_to_supabase_2(settings['event_id'], file_name, is_filtered)
-        print("[SUCCESS] Data berhasil disimpan ke tabel.")
+        print(f"[SUCCESS] Log tersimpan dengan status is_ai_filtered = {is_filtered}")
         
         return JSONResponse(content={
             "status": "success", 
             "message": "Gambar berhasil diproses dan disimpan.",
             "file_name": file_name,
+            "filter_enabled_in_db": is_filter_enabled,
             "is_filtered": is_filtered
         })
 
@@ -193,6 +196,3 @@ async def process_camera_image(slug: str, image: UploadFile = File(...)):
     except Exception as e:
         print(f"[FATAL ERROR] {str(e)}")
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-# PERUBAHAN: Bagian `if __name__ == "__main__": uvicorn.run(...)` DIDELETE 
-# karena Vercel menangani server ASGI secara internal.
